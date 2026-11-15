@@ -424,6 +424,7 @@ let CTX = null;
 function newCtx() {
   return {
     links: Object.create(null),
+    hasLinks: false,
     inlineQueue: [],
     state: {
       inLink: false,
@@ -787,6 +788,15 @@ function tokBlockquote(src) {
   }
 }
 
+// First line of a string, without allocating a split array.
+function firstLineOf(s) {
+  const nl = s.indexOf('\n');
+  return nl < 0 ? s : s.slice(0, nl);
+}
+
+// A line holding only whitespace (what String trim() would empty).
+const BLANK_ONLY = /^\s*$/;
+
 function tokList(src) {
   let cap = BLOCK.list.exec(src);
   if (cap) {
@@ -817,10 +827,10 @@ function tokList(src) {
       const itemStart = taken();
       src = src.substring(cap[0].length);
 
-      const firstLine = cap[2].split('\n', 1)[0];
+      const firstLine = firstLineOf(cap[2]);
       const bulletIndent = cap[1].length;
       let line = firstLine.replace(RE.leadingSpaceTab, (whitespace) => expandTabs(whitespace, bulletIndent));
-      let nextLine = src.split('\n', 1)[0];
+      let nextLine = firstLineOf(src);
       let blankLine = !line.trim();
 
       let indent = 0;
@@ -847,28 +857,38 @@ function tokList(src) {
         const blockquoteBeginRegex = RE.blockquoteBeginRegex(indent);
 
         while (src) {
-          const rawLine = src.split('\n', 1)[0];
+          const rawLine = firstLineOf(src);
           nextLine = rawLine;
-          const nextLineWithoutTabs = nextLine.replace(RE.leadingSpaceTab, (whitespace) => expandTabs(whitespace));
+          // Expand a leading tab run only when the line has leading
+          // whitespace; otherwise the replace is a wasted scan.
+          const nextLineWithoutTabs = (nextLine[0] === ' ' || nextLine[0] === '\t')
+            ? nextLine.replace(RE.leadingSpaceTab, (whitespace) => expandTabs(whitespace))
+            : nextLine;
+          const nl0 = nextLine[0];
 
-          if (fencesBeginRegex.test(nextLine)) break;
-          if (headingBeginRegex.test(nextLine)) break;
-          if (htmlBeginRegex.test(nextLine)) break;
-          if (blockquoteBeginRegex.test(nextLine)) break;
-          if (nextBulletRegex.test(nextLine)) break;
-          if (hrRegex.test(nextLine)) break;
+          // Each begin-pattern is anchored and can only match from its
+          // trigger character; skip the test otherwise. Order is marked's.
+          if ((nl0 === ' ' || nl0 === '\t' || nl0 === '`' || nl0 === '~') && fencesBeginRegex.test(nextLine)) break;
+          if ((nl0 === ' ' || nl0 === '\t' || nl0 === '#') && headingBeginRegex.test(nextLine)) break;
+          if ((nl0 === ' ' || nl0 === '\t' || nl0 === '<') && htmlBeginRegex.test(nextLine)) break;
+          if ((nl0 === ' ' || nl0 === '\t' || nl0 === '>') && blockquoteBeginRegex.test(nextLine)) break;
+          if ((nl0 === ' ' || nl0 === '\t' || nl0 === '*' || nl0 === '-' || nl0 === '+' || (nl0 >= '0' && nl0 <= '9')) && nextBulletRegex.test(nextLine)) break;
+          if ((nl0 === ' ' || nl0 === '\t' || nl0 === '-' || nl0 === '_' || nl0 === '*') && hrRegex.test(nextLine)) break;
 
-          if (nextLineWithoutTabs.search(RE.nonSpaceChar) >= indent || !nextLine.trim()) {
+          const nextBlank = BLANK_ONLY.test(nextLine);
+          if (nextLineWithoutTabs.search(RE.nonSpaceChar) >= indent || nextBlank) {
             itemContents += '\n' + nextLineWithoutTabs.slice(indent);
           } else {
             if (blankLine) break;
-            if (line.replace(RE.tabCharGlobal, '    ').search(RE.nonSpaceChar) >= 4) break;
-            if (fencesBeginRegex.test(line)) break;
-            if (headingBeginRegex.test(line)) break;
-            if (htmlBeginRegex.test(line)) break;
-            if (hrRegex.test(line)) break;
+            const l0 = line[0];
+            if ((line.includes('\t') ? line.replace(RE.tabCharGlobal, '    ') : line).search(RE.nonSpaceChar) >= 4) break;
+            if ((l0 === ' ' || l0 === '\t' || l0 === '`' || l0 === '~') && fencesBeginRegex.test(line)) break;
+            if ((l0 === ' ' || l0 === '\t' || l0 === '#') && headingBeginRegex.test(line)) break;
+            if ((l0 === ' ' || l0 === '\t' || l0 === '<') && htmlBeginRegex.test(line)) break;
+            if ((l0 === ' ' || l0 === '\t' || l0 === '-' || l0 === '_' || l0 === '*') && hrRegex.test(line)) break;
 
-            const setextContinuation = /^ {0,3}(?:=+|-+) *$/.test(nextLine)
+            const setextContinuation = (nl0 === ' ' || nl0 === '\t' || nl0 === '=' || nl0 === '-')
+              && /^ {0,3}(?:=+|-+) *$/.test(nextLine)
               && BLOCK.lheading.test(`${line}\n${nextLine}`);
             const continuation = setextContinuation
               ? `    ${nextLineWithoutTabs.replace(/^ {0,3}/, '')}`
@@ -876,7 +896,7 @@ function tokList(src) {
             itemContents += '\n' + continuation;
           }
 
-          blankLine = !nextLine.trim();
+          blankLine = nextBlank;
           src = src.substring(rawLine.length + 1);
           line = nextLineWithoutTabs.slice(indent);
         }
@@ -1352,8 +1372,32 @@ function tokInlineText(src) {
 // Lexer (marked src/Lexer.ts)
 // ---------------------------------------------------------------------------
 
+// A setext underline line, anywhere in src: necessary (not sufficient)
+// for the lheading pattern to match.
+const SETEXT_LINE = /\n {0,3}(?:=+|-+)[ \t]*(?:\n|$)/;
+// A table delimiter row, as a whole line: the table pattern's delimiter
+// group, which must occupy the second line.
+const TABLE_DELIM_LINE = /^ {0,3}(?:\| *)?:?-+:? *(?:\| *:?-+:? *)*(?:\| *)?$/;
+
+function lheadingPossible(src) {
+  // A setext heading's text cannot cross a blank line, so its underline
+  // must sit before the first one. Only scan that far: testing the whole
+  // remaining source here would be quadratic on long documents.
+  const blank = src.search(/\n[ \t]*\n/);
+  const head = blank < 0 ? src : src.slice(0, blank);
+  return SETEXT_LINE.test(head);
+}
+
+function tablePossible(src) {
+  const nl1 = src.indexOf('\n');
+  if (nl1 < 0) return false;
+  const nl2 = src.indexOf('\n', nl1 + 1);
+  const line2 = nl2 < 0 ? src.slice(nl1 + 1) : src.slice(nl1 + 1, nl2);
+  return TABLE_DELIM_LINE.test(line2);
+}
+
 function lex(src) {
-  src = src.replace(RE.carriageReturn, '\n');
+  if (src.includes('\r')) src = src.replace(RE.carriageReturn, '\n');
   const tokens = [];
   blockTokens(src, tokens);
   for (let i = 0; i < CTX.inlineQueue.length; i++) {
@@ -1461,6 +1505,7 @@ function blockTokens(src, tokens = [], lastParagraphClipped = false) {
         // The first definition of a label wins, but a later one still consumes its text
         if (!CTX.links[token.tag]) {
           CTX.links[token.tag] = { href: token.href, title: token.title };
+          CTX.hasLinks = true;
         }
         tokens.push(token);
       }
@@ -1468,14 +1513,19 @@ function blockTokens(src, tokens = [], lastParagraphClipped = false) {
     }
 
     // table (gfm)
-    if (token = tokTable(src)) {
+    // A table's second line must be a delimiter row; skip the (costly)
+    // table pattern when it cannot be. The gate is a necessary condition:
+    // the full pattern still decides.
+    if (tablePossible(src) && (token = tokTable(src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
     }
 
     // lheading
-    if (token = tokLheading(src)) {
+    // A setext heading needs an underline line (=== or ---) after the
+    // first line; skip the (costly) pattern when none can exist.
+    if (lheadingPossible(src) && (token = tokLheading(src))) {
       src = src.substring(token.raw.length);
       tokens.push(token);
       continue;
@@ -1552,10 +1602,21 @@ function inlineTokens(src, tokens = []) {
 }
 
 function inlineTokensInner(src, tokens) {
-  const maskedSrc = src.includes('*') || src.includes('_') || src.includes('~')
-    ? maskSrc(src)
-    : src;
-  beginCloserScan(maskedSrc);
+  let maskedSrc = src;
+  let frame = null;
+  if (src.includes('*') || src.includes('_') || src.includes('~')) {
+    // Masking only matters to emStrong and del, which need a closer run.
+    // If the closer scan finds none, no emphasis can form and the mask
+    // (three regex passes) is pure waste; the frame is still valid for
+    // the unmasked source, since masking never adds a delimiter.
+    frame = scanClosers(src);
+    if (frame.lastEm['*'] >= 0 || frame.lastEm['_'] >= 0 || frame.lastDel >= 0) {
+      maskedSrc = maskSrc(src);
+      frame = null;
+    }
+  }
+  if (frame) CTX.hintStack.push(frame);
+  else beginCloserScan(maskedSrc);
   try {
     return tokenizeInlines(src, maskedSrc, tokens);
   } finally {
@@ -1579,80 +1640,90 @@ function tokenizeInlines(src, maskedSrc, tokens) {
 
     let token;
 
-    // escape
-    if (token = tokEscape(src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // tag
-    if (token = tokTag(src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // link
-    if (token = tokLink(src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // reflink, nolink
-    if (token = tokReflink(src)) {
-      src = src.substring(token.raw.length);
-      const lastToken = tokens.at(-1);
-      if (token.type === 'text' && lastToken?.type === 'text') {
-        lastToken.raw += token.raw;
-        lastToken.text += token.text;
-      } else {
+    // First-character dispatch: every inline tokenizer's pattern is
+    // anchored, so it can only match when src starts with its trigger
+    // character. Trying the others first would only burn failed execs.
+    // The relative order inside each group is marked's order.
+    const c = src[0];
+    if (c === '\\') {
+      // escape, br
+      if (token = tokEscape(src)) {
+        src = src.substring(token.raw.length);
         tokens.push(token);
+        continue;
       }
-      continue;
-    }
-
-    // em & strong
-    if (token = tokEmStrong(src, maskedSrc, prevChar)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // code
-    if (token = tokCodespan(src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // br
-    if (token = tokBr(src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // del (gfm)
-    if (token = tokDel(src, maskedSrc, prevChar)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // autolink
-    if (token = tokAutolink(src)) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
-    }
-
-    // url (gfm)
-    if (!CTX.state.inLink && (token = tokUrl(src))) {
-      src = src.substring(token.raw.length);
-      tokens.push(token);
-      continue;
+      if (token = tokBr(src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if (c === '<') {
+      // tag, autolink
+      if (token = tokTag(src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+      if (token = tokAutolink(src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if (c === '[' || c === '!') {
+      // link, reflink
+      if (token = tokLink(src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+      if (token = tokReflink(src)) {
+        src = src.substring(token.raw.length);
+        const lastToken = tokens.at(-1);
+        if (token.type === 'text' && lastToken?.type === 'text') {
+          lastToken.raw += token.raw;
+          lastToken.text += token.text;
+        } else {
+          tokens.push(token);
+        }
+        continue;
+      }
+    } else if (c === '*' || c === '_') {
+      // em & strong
+      if (token = tokEmStrong(src, maskedSrc, prevChar)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if (c === '`') {
+      // code
+      if (token = tokCodespan(src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if (c === '~') {
+      // del (gfm)
+      if (token = tokDel(src, maskedSrc, prevChar)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else if (c === ' ') {
+      // br (two spaces + newline)
+      if (token = tokBr(src)) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
+    } else {
+      // url (gfm) — a url can start with a letter, digit or '.'; the
+      // text pattern's own lookaheads stop it before a url mid-run, so
+      // trying url here (before text) is exactly marked's order.
+      if (!CTX.state.inLink && (token = tokUrl(src))) {
+        src = src.substring(token.raw.length);
+        tokens.push(token);
+        continue;
+      }
     }
 
     // text
@@ -1685,8 +1756,8 @@ function tokenizeInlines(src, maskedSrc, tokens) {
 function maskSrc(src) {
   let maskedSrc = src;
 
-  // Mask out reflinks
-  if (CTX.links && src.includes('[')) {
+  // Mask out reflinks (only when a definition exists to resolve one)
+  if (CTX.hasLinks && src.includes('[')) {
     const reflinkSearch = INLINE.reflinkSearch;
     const maskReflink = (match0) => {
       const refStart = match0.lastIndexOf('[');
@@ -1714,17 +1785,24 @@ function maskSrc(src) {
   // maskedSrc up with src by slicing from the end. A backslash inside a
   // code span is literal, not an escape; mask the backticks inside the span
   // instead, so blockSkip still skips all of it.
-  maskedSrc = maskedSrc.replace(INLINE.anyPunctuationOutsideCode, (match0, code, punct) => {
-    if (punct) return '+'.repeat(match0.length);
-    if (code) return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
-    return match0;
-  });
+  // Mask out escaped characters. This pattern can only match a backtick
+  // run or a backslash escape, so skip it when neither is present.
+  if (src.includes('\\') || src.includes('`')) {
+    maskedSrc = maskedSrc.replace(INLINE.anyPunctuationOutsideCode, (match0, code, punct) => {
+      if (punct) return '+'.repeat(match0.length);
+      if (code) return code + match0.slice(code.length, -code.length).replace(/`/g, '+') + code;
+      return match0;
+    });
+  }
 
-  // Mask out other blocks
-  maskedSrc = maskedSrc.replace(INLINE.blockSkip, (match0, _link, context) => {
-    const offset = context ? context.length : 0;
-    return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
-  });
+  // Mask out other blocks. blockSkip can only match a link ([), a code
+  // span (`) or raw HTML (<), so skip it when none of those is present.
+  if (src.includes('[') || src.includes('`') || src.includes('<')) {
+    maskedSrc = maskedSrc.replace(INLINE.blockSkip, (match0, _link, context) => {
+      const offset = context ? context.length : 0;
+      return match0.slice(0, offset) + '[' + 'a'.repeat(match0.length - offset - 2) + ']';
+    });
+  }
 
   return maskedSrc;
 }
