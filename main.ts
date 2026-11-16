@@ -1,4 +1,5 @@
 // Driver for the markdown-render-speed-02 entry.
+// Round 2 resubmit — rewritten under recording R4 (2026-11-16).
 //
 // The harness runs `node main.ts` (node 22+). It reads every case from
 // /input/cases.json (a JSON array of {id, markdown}), renders each one

@@ -1,4 +1,5 @@
 // parse.js — a fast, dependency-free Markdown renderer.
+// Round 2 resubmit — rewritten under recording R4 (2026-11-16).
 //
 // Renders exactly what marked 18.1.3 renders with its default options
 // (GFM on, hard breaks off, pedantic off): for every input string the HTML
